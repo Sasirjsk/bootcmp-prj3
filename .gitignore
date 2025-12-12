@@ -1,0 +1,29 @@
+# .NET
+bin/
+obj/
+[Bb]uild/
+artifacts/
+out/
+publish/
+*.zip
+
+# Tests & coverage
+TestResults/
+*.trx
+*.coverage
+*.coveragexml
+coverage/
+
+# IDEs / tooling
+.vs/
+.vscode/
+.idea/
+_ReSharper*/
+*.DotSettings.user
+
+# User/OS
+*.user
+*.suo
+*.sln.docstates
+.DS_Store
+Thumbs.db
