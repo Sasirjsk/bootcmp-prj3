@@ -1,0 +1,285 @@
+trigger:
+  - main
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  BUILD_CONFIGURATION: 'Release' 
+  Test_path: 'tests/DotNetWebApp.Tests/DotNetWebApp.Tests.csproj'
+  PUBLISH_DIR: '$(Build.ArtifactStagingDirectory)/publish'
+  ARTIFACT_NAME: 'drop'
+  WEB_PROJECT: 'src/DotNetWebApp/DotNetWebApp.csproj'
+
+stages:
+- stage: BuildTest
+  displayName: "Build .NET WebApp"
+  jobs:
+  - job: BuildJob
+    displayName: "Build Job"
+    steps:
+    - task: UseDotNet@2
+      inputs:
+        packageType: 'sdk'
+        version: '8.0.x'
+
+    - task: DotNetCoreCLI@2
+      inputs:
+        command: 'restore'
+        projects: 'DotNetWebApp.sln'
+       
+    
+
+    - task: DotNetCoreCLI@2
+      inputs:
+        command: 'build'
+        projects: 'DotNetWebApp.sln'
+        arguments: '--configuration $(BUILD_CONFIGURATION) --no-restore'
+
+    - task: DotNetCoreCLI@2
+      inputs:
+        command: 'test'
+        projects: '$(Test_path)'
+        arguments: '--configuration $(BUILD_CONFIGURATION) --no-build --logger "trx;LogFileName=test_results.trx"'
+
+    
+    - task: DotNetCoreCLI@2
+      inputs:
+        command: 'publish'
+        publishWebProjects: false
+        projects: '$(WEB_PROJECT)'
+        arguments: '--configuration $(BUILD_CONFIGURATION) --no-build --output "$(PUBLISH_DIR)"'
+
+    - task: ArchiveFiles@2
+      inputs:
+        rootFolderOrFile: '$(PUBLISH_DIR)'
+        includeRootFolder: false
+        archiveType: 'zip'
+        archiveFile: '$(Build.ArtifactStagingDirectory)/$(Build.BuildId).zip'
+        replaceExistingArchive: true
+
+    - task: PublishPipelineArtifact@1
+      inputs:
+        targetPath: '$(Build.ArtifactStagingDirectory)'
+        artifact: '$(ARTIFACT_NAME)'
+        publishLocation: 'pipeline'
+
+
+- stage: Deploy_Dev
+  displayName: 'Deployment_Dev_env'
+  dependsOn: BuildTest
+  condition: succeeded()
+  jobs:
+    - deployment: DeployDev
+      displayName: "Deployment Dev"    
+      environment: 'dev'
+      strategy:
+       runOnce:
+         deploy:
+           steps:
+             - download: current
+               artifact: '$(ARTIFACT_NAME)'
+
+             - script: |
+                 echo "Downloaded artifact contents:"
+                 ls -R $(Pipeline.Workspace)/$(ARTIFACT_NAME)
+               displayName: Verify downloaded artifact  
+
+             - task: AzureWebApp@1
+               inputs:
+                 azureSubscription: 'Arm-dev'
+                 appType: 'webApp'
+                 appName: 'webapp-dev-ca'
+                 package: '$(Pipeline.Workspace)/drop/publish/DotNetWebApp.zip'
+                 deploymentMethod: 'auto'
+               
+
+- stage: Deploy_stage
+  displayName: 'Deployment_Stage_env'
+  dependsOn: Deploy_Dev
+  condition: succeeded()
+  jobs:
+  - deployment: StageDev
+    displayName: "Stage Dev"    
+    environment: 'Stage'
+    pool:
+      vmImage: 'windows-latest'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+
+          - download: current
+            artifact: '$(ARTIFACT_NAME)'
+
+          - script: |
+              echo "Downloaded artifact contents:"
+              dir /s "$(Pipeline.Workspace)\$(ARTIFACT_NAME)"
+            displayName: Verify downloaded artifact  
+
+
+
+          - task: AzureRmWebAppDeployment@5
+            displayName: Deploy Stage Wepapp to Green
+            inputs:
+              ConnectionType: 'AzureRM'
+              azureSubscription: 'Arm-Stage'
+              appType: 'webApp'
+              WebAppName: 'webapp-stage-ca'
+              deployToSlotOrASE: true
+              ResourceGroupName: 'rg-stage-ca'
+              SlotName: 'green'
+              packageForLinux: '$(Pipeline.Workspace)\$(ARTIFACT_NAME)\publish\DotNetWebApp.zip'
+              enableCustomDeployment: true
+              DeploymentType: 'webDeploy'
+              ExcludeFilesFromAppDataFlag: false
+              RenameFilesFlag: false
+        
+          - powershell: |
+              $url = "https://webapp-stage-ca-green.azurewebsites.net"
+              Write-Host "Pinging $url ..."
+              for ($i=0; $i -lt 10; $i++) {
+                try {
+                  $r = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 10
+                  if ($r.StatusCode -eq 200) {
+                    Write-Host "Healthy"
+                    exit 0
+                  }
+                } catch {
+                  Start-Sleep -Seconds 3
+                }
+              }
+              Write-Error "Health check failed"
+              exit 1
+            displayName: Health check on GREEN slot
+
+        
+- stage: SwapToProduction
+  displayName: 'Swap GREEN → PRODUCTION in stage UAT'
+  dependsOn: Deploy_Stage
+  condition: succeeded()
+  jobs:        
+  - deployment: SwapToProd
+    displayName: "Swap stage GREEN to RODUCTION"
+    environment: 'Stage-swap'   
+    condition: succeeded()
+    pool:
+      vmImage: 'windows-latest'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: AzureAppServiceManage@0
+            displayName: 'Swap GREEN → PRODUCTION Stage UAT'
+            inputs:
+              azureSubscription: 'Arm-Stage'
+              Action: 'Swap Slots'
+              WebAppName: 'webapp-stage-ca'
+              ResourceGroupName: 'rg-stage-ca'
+              SourceSlot: 'green'
+              SwapWithProduction: true
+              TargetSlot: 'production'    
+             
+- stage: Deploy_Production
+  displayName: 'Deploy Green to Production envt'
+  dependsOn: SwapToProduction
+  condition: succeeded()
+  jobs:
+  - deployment: ProdSlot
+    displayName: "Deploy to Production ProdSlot"
+    environment: 'production'   
+    pool:
+      vmImage: 'windows-latest'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+            - download: current
+              artifact: '$(ARTIFACT_NAME)'
+
+            # Deploy GREEN content to actual production environment
+
+            - task: AzureRmWebAppDeployment@5
+              displayName: Deploy to Prod slot
+              inputs:
+                ConnectionType: 'AzureRM'
+                azureSubscription: 'Arm-prod'
+                appType: 'webApp'
+                WebAppName: 'webapp-prod-ca'
+                deployToSlotOrASE: true
+                ResourceGroupName: 'rg-prod-ca'
+                SlotName: 'prod'
+                packageForLinux: '$(Pipeline.Workspace)/drop/publish/DotNetWebApp.zip'
+                enableCustomDeployment: true
+                DeploymentType: 'webDeploy'
+                ExcludeFilesFromAppDataFlag: false
+                RenameFilesFlag: false
+            
+            # Health check on production
+            - powershell: |
+                $url = "https://webapp-prod-ca-prod.azurewebsites.net"
+                Write-Host "Checking Production health..."
+                for ($i=0; $i -lt 10; $i++) {
+                  try {
+                    $r = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 10
+                    if ($r.StatusCode -eq 200) {
+                      Write-Host "Production healthy"
+                      exit 0
+                    }
+                  } catch {
+                    Start-Sleep -Seconds 3
+                  }
+                }
+                Write-Error "Production health check failed"
+                exit 1
+              displayName: Health check on Production
+              
+
+            - task: AzureAppServiceManage@0
+              displayName: swap prod slot to production envt
+              inputs:
+                azureSubscription: 'Arm-prod'
+                Action: 'Swap Slots'
+                WebAppName: 'webapp-prod-ca'
+                ResourceGroupName: 'rg-prod-ca'
+                SourceSlot: 'prod'
+                SwapWithProduction: true
+                TargetSlot: 'production'   
+
+            # Health check on real production
+            - powershell: |
+                $url = "https://webapp-prod-ca-prod.azurewebsites.net"
+                Write-Host "Checking Production health after swap..."
+                for ($i=0; $i -lt 15; $i++) {
+                  try {
+                    $r = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 10
+                    if ($r.StatusCode -eq 200) {
+                      Write-Host "Production healthy"
+                      exit 0
+                    }
+                  } catch {
+                    Write-Host "Attempt $($i+1) failed, waiting 10s..."
+                    Start-Sleep -Seconds 10
+                  }
+                }
+                Write-Error "Production health check failed after swap"
+                exit 1
+              displayName: Health check on Production
+              continueOnError: false     
+
+            # Rollback if health check fails
+            - task: AzureRmWebAppDeployment@5
+              displayName: 'Rollback Production to previous state'
+              inputs:
+                ConnectionType: 'AzureRM'
+                azureSubscription: 'Arm-Prod'
+                appType: 'webApp'
+                WebAppName: 'webapp-prod-ca'
+                deployToSlotOrASE: false
+                ResourceGroupName: 'rg-prod-ca'
+                packageForLinux: '$(Pipeline.Workspace)/drop/publish/previous_build.zip'  # keep previous build artifact for rollback
+                enableCustomDeployment: true
+                DeploymentType: 'webDeploy'
+              condition: failed()             
+
+       
